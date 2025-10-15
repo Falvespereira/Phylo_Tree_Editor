@@ -1,0 +1,97 @@
+{
+  "nodes": [
+    {
+      "id": "n1",
+      "x": 856.0,
+      "y": 103.0,
+      "text": "A"
+    },
+    {
+      "id": "n2",
+      "x": 210.0,
+      "y": 129.0,
+      "text": "B"
+    },
+    {
+      "id": "n3",
+      "x": 691.0,
+      "y": 239.0,
+      "text": "C"
+    },
+    {
+      "id": "n4",
+      "x": 944.0,
+      "y": 279.0,
+      "text": "D"
+    },
+    {
+      "id": "n5",
+      "x": 199.0,
+      "y": 281.0,
+      "text": "E"
+    },
+    {
+      "id": "n6",
+      "x": 405.0,
+      "y": 292.0,
+      "text": "F"
+    }
+  ],
+  "edges": [
+    {
+      "from": "n2",
+      "to": "n5"
+    },
+    {
+      "from": "n2",
+      "to": "n6"
+    },
+    {
+      "from": "n1",
+      "to": "n3"
+    },
+    {
+      "from": "n1",
+      "to": "n4"
+    }
+  ],
+  "formats": {
+    "newick": [
+      "('C','D')'A';",
+      "('E','F')'B';"
+    ],
+    "parent_list": [
+      {
+        "id": "n1",
+        "label": "A",
+        "parent": null
+      },
+      {
+        "id": "n2",
+        "label": "B",
+        "parent": null
+      },
+      {
+        "id": "n3",
+        "label": "C",
+        "parent": "n1"
+      },
+      {
+        "id": "n4",
+        "label": "D",
+        "parent": "n1"
+      },
+      {
+        "id": "n5",
+        "label": "E",
+        "parent": "n2"
+      },
+      {
+        "id": "n6",
+        "label": "F",
+        "parent": "n2"
+      }
+    ],
+    "warnings": []
+  }
+}
