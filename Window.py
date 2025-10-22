@@ -5,6 +5,7 @@ import json
 import math
 import os
 import re
+from contextlib import contextmanager
 
 # ---------- Appearance / constants ----------
 NODE_WIDTH = 140
@@ -25,6 +26,13 @@ TEXT_MAX_WIDTH = 1000       # large so nodes can fit more text
 TEXT_PADDING_X = 20         # left/right padding inside the box
 TEXT_PADDING_Y = 12         # top/bottom padding inside the box
 
+# Debounce delays (ms)
+GRID_REDRAW_DELAY = 40
+ZOOM_RELINE_DELAY = 20
+
+# Nudge between sequential pastes
+PASTE_NUDGE = 20
+
 
 class MindMapApp:
     def __init__(self, root):
@@ -33,6 +41,7 @@ class MindMapApp:
         root.geometry("1200x760")
 
         self.mode = tk.StringVar(value="select")          # 'select', 'add', 'connect'
+        self.select_mode = tk.StringVar(value="single")   # 'single' or 'clade'
         self.label_mode = tk.StringVar(value="subtree")   # 'subtree' or 'component'
         self.label_source = tk.StringVar(value="auto")    # 'auto' or 'manual'
         self.snap_var = tk.BooleanVar(value=False)
@@ -58,10 +67,23 @@ class MindMapApp:
         # Rebuild throttling & caches
         self._rebuild_scheduled = False
         self._text_cache = {}                 # node_id -> last displayed text
+        self._measure_cache = {}              # (display, scale, font_sig) -> (w,h)
         self._layout_moved = False
 
-        # Bulk import flag (skip per-node rebuild work)
-        self._bulk = False
+        # Dirty sets (what to recompute)
+        self._dirty_nodes_text = set()        # nodes needing text/display refresh
+        self._dirty_nodes_geom = set()        # nodes needing resize to text
+        self._graph_version = 0               # bump when edges change (invalidates subtree cache)
+
+        # Bulk / debouncing
+        self._bulk_depth = 0
+        self._pending_grid_job = None
+        self._pending_zoom_job = None
+
+        # Clipboard
+        self._clipboard = None
+        self._last_paste_offset = (0, 0)
+        self._last_mouse_canvas = None
 
         # ---------- Menubar ----------
         menubar = tk.Menu(root)
@@ -85,7 +107,8 @@ class MindMapApp:
                 "About",
                 "Mind Map (Tkinter)\n\nJSON & Newick import • Forest/Combined Newick export\n"
                 "Autosize • Pan/Zoom • Multiselect • Snap grid • Label source/scope\n"
-                "Pretty/Compact/Depth display • Collision-free Newick import"
+                "Pretty/Compact/Depth display • Collision-free Newick import\n"
+                "Copy/Cut/Paste • Selection mode: Single / Clade"
             )
         )
         menubar.add_cascade(label="Help", menu=helpmenu)
@@ -94,6 +117,9 @@ class MindMapApp:
         root.bind("<Control-n>", lambda e: self.new_document())
         root.bind("<Control-o>", lambda e: self.import_any())
         root.bind("<Control-s>", lambda e: self.export_json())
+        root.bind("<Control-c>", self.on_copy)
+        root.bind("<Control-x>", self.on_cut)
+        root.bind("<Control-v>", self.on_paste)
 
         # ---------- Toolbar ----------
         bar = ttk.Frame(root, padding=6)
@@ -102,6 +128,14 @@ class MindMapApp:
         ttk.Label(bar, text="Mode:").pack(side=tk.LEFT, padx=(0, 4))
         for label, val in [("Select/Drag", "select"), ("Add node", "add"), ("Connect", "connect")]:
             ttk.Radiobutton(bar, text=label, value=val, variable=self.mode).pack(side=tk.LEFT)
+
+        ttk.Separator(bar, orient=tk.VERTICAL).pack(side=tk.LEFT, fill=tk.Y, padx=8)
+        ttk.Label(bar, text="Selection:").pack(side=tk.LEFT, padx=(0, 4))
+        sel_cb = ttk.Combobox(
+            bar, state="readonly", width=10,
+            values=["single", "clade"], textvariable=self.select_mode
+        )
+        sel_cb.pack(side=tk.LEFT)
 
         ttk.Separator(bar, orient=tk.VERTICAL).pack(side=tk.LEFT, fill=tk.Y, padx=8)
         ttk.Checkbutton(bar, text="Snap to grid", variable=self.snap_var, command=self.on_toggle_snap).pack(
@@ -115,7 +149,7 @@ class MindMapApp:
             values=["subtree", "component"], textvariable=self.label_mode
         )
         mode_cb.pack(side=tk.LEFT)
-        mode_cb.bind("<<ComboboxSelected>>", lambda e: self.request_rebuild())
+        mode_cb.bind("<<ComboboxSelected>>", lambda e: self.request_rebuild(all_nodes=False, text_only=True))
 
         # --- Display detail selector ---
         ttk.Separator(bar, orient=tk.VERTICAL).pack(side=tk.LEFT, fill=tk.Y, padx=8)
@@ -126,7 +160,7 @@ class MindMapApp:
             textvariable=self.display_detail
         )
         detail_cb.pack(side=tk.LEFT)
-        detail_cb.bind("<<ComboboxSelected>>", lambda e: self.request_rebuild())
+        detail_cb.bind("<<ComboboxSelected>>", lambda e: self.request_rebuild(all_nodes=False))
 
         # --- Newick export mode ---
         ttk.Separator(bar, orient=tk.VERTICAL).pack(side=tk.LEFT, fill=tk.Y, padx=8)
@@ -143,14 +177,10 @@ class MindMapApp:
         scale_entry = ttk.Spinbox(
             bar, from_=0.5, to=3.0, increment=0.1, width=5,
             textvariable=self.node_scale,
-            command=self.on_node_scale_change  # apply when arrows/click used
+            command=self.on_node_scale_change
         )
         scale_entry.pack(side=tk.LEFT)
-        # also apply when typing
         self._ns_trace_id = self.node_scale.trace_add("write", self.on_node_scale_change)
-
-        ttk.Separator(bar, orient=tk.VERTICAL).pack(side=tk.LEFT, fill=tk.Y, padx=8)
-        ttk.Button(bar, text="Export JSON", command=self.export_json).pack(side=tk.LEFT, padx=2)
 
         self.zoom_label = ttk.Label(bar, text="Zoom: 100%")
         self.zoom_label.pack(side=tk.RIGHT)
@@ -158,7 +188,7 @@ class MindMapApp:
         # ---------- Canvas ----------
         self.canvas = tk.Canvas(root, bg="#f7fafc", highlightthickness=0)
         self.canvas.pack(fill=tk.BOTH, expand=True)
-        self.canvas.bind("<Configure>", lambda e: self.draw_grid())
+        self.canvas.bind("<Configure>", self._debounced_draw_grid)
 
         # Data
         self.nodes = {}  # node_id -> {"rect": id, "text": id, "lines": set()}
@@ -188,7 +218,7 @@ class MindMapApp:
         # Middle button pan
         self.canvas.bind("<Button-2>", self.on_mid_down)
         self.canvas.bind("<B2-Motion>", self.on_mid_drag)
-        self.canvas.bind("<ButtonRelease-2>", lambda e: self.draw_grid())
+        self.canvas.bind("<ButtonRelease-2>", self._debounced_draw_grid)
 
         # Zoom (Ctrl + Mouse Wheel)
         root.bind("<Control-MouseWheel>", self.on_zoom)
@@ -204,14 +234,47 @@ class MindMapApp:
         self.update_scrollregion()
         self.draw_grid()
 
+    # ---------- Utility / batching ----------
+    @contextmanager
+    def bulk_update(self):
+        """Group many edits into one repaint/rebuild pass."""
+        self._bulk_depth += 1
+        try:
+            yield
+        finally:
+            self._bulk_depth -= 1
+            if self._bulk_depth == 0:
+                self._flush_dirty()
+
+    def _mark_text_dirty(self, nid):
+        self._dirty_nodes_text.add(nid)
+
+    def _mark_geom_dirty(self, nid):
+        self._dirty_nodes_geom.add(nid)
+
+    def _flush_dirty(self):
+        if self._dirty_nodes_text:
+            self._rebuild_nodes_text(self._dirty_nodes_text)
+            self._dirty_nodes_text.clear()
+        if self._dirty_nodes_geom:
+            for nid in list(self._dirty_nodes_geom):
+                self.resize_node_to_text(nid)
+            self.update_connected_lines(self._dirty_nodes_geom)
+            self._dirty_nodes_geom.clear()
+        self.update_scrollregion()
+
     # ---------- Help ----------
     def show_tips(self):
         tips = (
             "General:\n"
             " • Mode: Select/Drag, Add node, Connect\n"
+            " • Selection: Single (just node/edge) or Clade (node + all descendants)\n"
             " • Double-click a node to edit its label\n"
             " • Right-click deletes the item under the cursor\n"
             " • Delete / Backspace removes selected items\n\n"
+            "Clipboard:\n"
+            " • Ctrl+C to copy, Ctrl+X to cut, Ctrl+V to paste\n"
+            " • Copies selected nodes (and edges among them); if only an edge is selected, copies the edge and both endpoints\n\n"
             "Selection:\n"
             " • Ctrl+Click toggles node selection\n"
             " • Ctrl+Drag draws a box to multi-select\n"
@@ -226,32 +289,34 @@ class MindMapApp:
             " • Middle-mouse drag to pan\n"
             " • Ctrl+MouseWheel to zoom (focus around cursor)\n\n"
             "Display:\n"
-            " • Display detail lets you condense nodes: Label only / Depth / Subtree\n"
+            " • Display detail condenses nodes: Label only / Depth / Subtree\n"
             " • Node scale globally enlarges boxes after text-fit\n"
         )
         messagebox.showinfo("Tips", tips)
 
     # ---------- Rebuild throttling ----------
-    def request_rebuild(self):
-        if self._rebuild_scheduled:
-            return
-        self._rebuild_scheduled = True
-        self.root.after_idle(self._do_rebuild)
+    def request_rebuild(self, all_nodes=False, text_only=False):
+        if all_nodes:
+            self._dirty_nodes_text |= set(self.nodes.keys())
+        else:
+            if not self._dirty_nodes_text:
+                self._dirty_nodes_text |= set(self.nodes.keys())
+
+        if not self._rebuild_scheduled and self._bulk_depth == 0:
+            self._rebuild_scheduled = True
+            self.root.after_idle(self._do_rebuild)
 
     def _do_rebuild(self):
         self._rebuild_scheduled = False
-        self.rebuild_all_node_newick()
+        self._flush_dirty()
 
     # ---------- Node scale handler ----------
     def on_node_scale_change(self, *_):
-        """Apply the current node_scale to all nodes and refresh anchors."""
         try:
             s = float(self.node_scale.get())
         except Exception:
             return
-        # clamp
         s = max(0.5, min(3.0, s))
-        # normalize the value (avoid recursive storms)
         if abs(s - float(self.node_scale.get())) > 1e-6:
             try:
                 self.node_scale.trace_remove("write", self._ns_trace_id)
@@ -259,12 +324,9 @@ class MindMapApp:
                 pass
             self.node_scale.set(s)
             self._ns_trace_id = self.node_scale.trace_add("write", self.on_node_scale_change)
-
-        # resize all nodes and update lines once
-        for nid in list(self.nodes.keys()):
-            self.resize_node_to_text(nid)
-        self.update_connected_lines(self.nodes.keys())
-        self.update_scrollregion()
+        self._dirty_nodes_geom |= set(self.nodes.keys())
+        if self._bulk_depth == 0:
+            self._flush_dirty()
 
     # ---------- Grid helpers ----------
     def on_toggle_snap(self):
@@ -282,7 +344,15 @@ class MindMapApp:
         y1 = self.canvas.canvasy(h)
         return x0, y0, x1, y1
 
+    def _debounced_draw_grid(self, event=None):
+        if not self.snap_var.get():
+            return
+        if self._pending_grid_job:
+            self.root.after_cancel(self._pending_grid_job)
+        self._pending_grid_job = self.root.after(GRID_REDRAW_DELAY, self.draw_grid)
+
     def draw_grid(self):
+        self._pending_grid_job = None
         self.canvas.delete("grid")
         if not self.snap_var.get():
             return
@@ -453,7 +523,6 @@ class MindMapApp:
         return "".join(out)
 
     def _display_from_newick(self, newick_str: str, label_for_node: str | None) -> str:
-        """Apply display detail + view to produce the *display* string."""
         detail = self.display_detail.get()
         s = newick_str
         if detail == "Label only":
@@ -464,21 +533,30 @@ class MindMapApp:
             s = self._limit_newick_depth(newick_str, 2) + ";"
         elif detail == "Subtree (compact)":
             s = newick_str
-        else:  # "Subtree (pretty)" will be handled by view step
+        else:  # "Subtree (pretty)"
             s = newick_str
 
         if self.newick_view.get() == "pretty" and detail != "Subtree (compact)":
             return self._pretty_newick(s)
         return s
 
-    # ---------- Text measuring + node sizing ----------
+    # ---------- Text measuring + node sizing (cached) ----------
+    def _font_signature(self):
+        return (self.text_font.actual("family"),
+                self.text_font.actual("size"),
+                self.text_font.actual("weight"))
+
     def _measure_display_str_wh(self, display_text: str,
                                 max_text_w=TEXT_MAX_WIDTH,
                                 pad_x=TEXT_PADDING_X,
                                 pad_y=TEXT_PADDING_Y,
                                 min_w=NODE_WIDTH,
                                 min_h=NODE_HEIGHT):
-        """Measure how the *display* string will render in a node, with wrap + padding + node scale."""
+        key = (display_text, round(float(self.node_scale.get()), 3), self._font_signature())
+        if key in self._measure_cache:
+            w, h = self._measure_cache[key]
+            return w, h
+
         tokens = re.findall(r"[^\s,()]+|[(),]", display_text)
         lines = []
         cur = ""
@@ -500,10 +578,11 @@ class MindMapApp:
         target_w = max(min_w, pad_x * 2 + text_w)
         target_h = max(min_h, pad_y * 2 + text_h)
 
-        # Apply global node scale
         scale = float(self.node_scale.get())
         target_w *= scale
         target_h *= scale
+
+        self._measure_cache[key] = (target_w, target_h)
         return target_w, target_h
 
     def resize_node_to_text(self, nid,
@@ -512,12 +591,6 @@ class MindMapApp:
                             pad_y=TEXT_PADDING_Y,
                             min_w=NODE_WIDTH,
                             min_h=NODE_HEIGHT):
-        """
-        Keep text inside the box:
-        - Wrap text to a max width inside the node.
-        - Resize the rounded rect to tightly contain the wrapped text + padding.
-        - Apply global node scale.
-        """
         node = self.nodes.get(nid)
         if not node:
             return
@@ -529,24 +602,13 @@ class MindMapApp:
         x1, y1, x2, y2 = bbox
         cur_w = max(1.0, (x2 - x1))
 
-        # Start with current inner width, then we will scale to target
         wrap_w = max(1, int(min(max_text_w, cur_w - 2 * pad_x)))
         self.canvas.itemconfigure(text_id, width=wrap_w, justify="center", anchor="center")
 
-        tb = self.canvas.bbox(text_id)
-        if not tb:
-            return
-        tx1, ty1, tx2, ty2 = tb
-        text_w = tx2 - tx1
-        text_h = ty2 - ty1
-
-        target_w = max(min_w, text_w + 2 * pad_x)
-        target_h = max(min_h, text_h + 2 * pad_y)
-
-        # Apply global node scale
-        scale_mul = float(self.node_scale.get())
-        target_w *= scale_mul
-        target_h *= scale_mul
+        display_text = self.canvas.itemcget(text_id, "text")
+        target_w, target_h = self._measure_display_str_wh(
+            display_text, max_text_w=max_text_w, pad_x=pad_x, pad_y=pad_y, min_w=min_w, min_h=min_h
+        )
 
         cx = (x1 + x2) / 2.0
         cy = (y1 + y2) / 2.0
@@ -556,7 +618,6 @@ class MindMapApp:
         if abs(sx - 1.0) > 0.01 or abs(sy - 1.0) > 0.01:
             self.canvas.scale(f"node_shape_{nid}", cx, cy, sx, sy)
 
-        # After scaling, fix final wrap width to final inner width
         nb = self.canvas.bbox(f"node_shape_{nid}")
         if not nb:
             return
@@ -565,7 +626,6 @@ class MindMapApp:
         final_wrap_w = max(1, int(min(max_text_w, final_inner_w)))
         self.canvas.itemconfigure(text_id, width=final_wrap_w)
 
-        # Re-anchor connected lines (edge-to-box)
         self._update_lines_for_nodes({nid})
 
     # ---------- Nodes / Edges ----------
@@ -621,11 +681,10 @@ class MindMapApp:
         if self.label_source.get() == "manual":
             self.manual_labels[node_id] = text
 
-        if not bulk:
-            self.update_scrollregion()
-            self.resize_node_to_text(node_id)
-            self.request_rebuild()
-
+        self._mark_geom_dirty(node_id)
+        self._mark_text_dirty(node_id)
+        if not bulk and self._bulk_depth == 0:
+            self._flush_dirty()
         return node_id
 
     def connect_nodes(self, a_id, b_id):
@@ -641,8 +700,13 @@ class MindMapApp:
         self.lines[line] = {"a": a_id, "b": b_id}
         self.nodes[a_id]["lines"].add(line)
         self.nodes[b_id]["lines"].add(line)
-        if not self._bulk:
-            self.request_rebuild()
+
+        self._graph_version += 1
+        self._mark_text_dirty(a_id)
+        self._mark_text_dirty(b_id)
+
+        if self._bulk_depth == 0:
+            self._flush_dirty()
         return line
 
     def _update_lines_for_nodes(self, node_ids):
@@ -664,13 +728,18 @@ class MindMapApp:
         self._update_lines_for_nodes(set(moved_node_ids))
 
     def delete_node(self, node_id):
-        for lid in list(self.nodes[node_id]["lines"]):
-            self.delete_line(lid, suppress_rebuild=True)
-        self.canvas.delete(f"node_{node_id}")
-        del self.nodes[node_id]
-        self._text_cache.pop(node_id, None)
-        self.manual_labels.pop(node_id, None)
-        self.request_rebuild()
+        with self.bulk_update():
+            for lid in list(self.nodes[node_id]["lines"]):
+                self.delete_line(lid, suppress_rebuild=True)
+            self.canvas.delete(f"node_{node_id}")
+            del self.nodes[node_id]
+            self._text_cache.pop(node_id, None)
+            self.manual_labels.pop(node_id, None)
+            self._graph_version += 1
+            for lid in list(self.lines.keys()):
+                info = self.lines[lid]
+                self._mark_text_dirty(info["a"])
+                self._mark_text_dirty(info["b"])
 
     def delete_line(self, line_id, suppress_rebuild=False):
         if line_id not in self.lines:
@@ -683,8 +752,12 @@ class MindMapApp:
             self.nodes[b]["lines"].discard(line_id)
         self.canvas.delete(line_id)
         del self.lines[line_id]
+        self._graph_version += 1
         if not suppress_rebuild:
-            self.request_rebuild()
+            self._mark_text_dirty(a)
+            self._mark_text_dirty(b)
+            if self._bulk_depth == 0:
+                self._flush_dirty()
 
     # ---------- Selection helpers ----------
     def clear_styles(self):
@@ -705,16 +778,57 @@ class MindMapApp:
         self.selected_line = None
         self.refresh_selection_style()
 
+    # --- children map & clade expansion ---
+    def _children_map(self):
+        """Return dict canvas_nid -> list(child_canvas_nid)."""
+        cmap = {nid: [] for nid in self.nodes.keys()}
+        for lid, info in self.lines.items():
+            a, b = info["a"], info["b"]  # a -> b
+            if a in cmap:
+                cmap[a].append(b)
+        return cmap
+
+    def _descendants(self, nid, cmap=None):
+        if cmap is None:
+            cmap = self._children_map()
+        out = set()
+        stack = [nid]
+        seen = set()
+        while stack:
+            u = stack.pop()
+            if u in seen:
+                continue
+            seen.add(u)
+            out.add(u)
+            for v in cmap.get(u, []):
+                stack.append(v)
+        return out
+
+    def _expand_to_clade(self, nids):
+        cmap = self._children_map()
+        out = set()
+        for nid in nids:
+            out |= self._descendants(nid, cmap)
+        return out
+
     def select_only_node(self, nid):
-        self.selected_nodes = {nid}
+        if self.select_mode.get() == "clade":
+            nset = self._expand_to_clade({nid})
+        else:
+            nset = {nid}
+        self.selected_nodes = nset
         self.selected_line = None
         self.refresh_selection_style()
 
     def select_toggle_node(self, nid):
-        if nid in self.selected_nodes:
-            self.selected_nodes.remove(nid)
+        if self.select_mode.get() == "clade":
+            nset = self._expand_to_clade({nid})
         else:
-            self.selected_nodes.add(nid)
+            nset = {nid}
+        if nset.issubset(self.selected_nodes):
+            self.selected_nodes -= nset
+        else:
+            self.selected_nodes |= nset
         self.selected_line = None
         self.refresh_selection_style()
 
@@ -724,7 +838,11 @@ class MindMapApp:
         self.refresh_selection_style()
 
     def select_all(self, event=None):
-        self.selected_nodes = set(self.nodes.keys())
+        if self.select_mode.get() == "clade":
+            # in clade mode, Ctrl+A still selects all nodes
+            self.selected_nodes = set(self.nodes.keys())
+        else:
+            self.selected_nodes = set(self.nodes.keys())
         self.selected_line = None
         self.refresh_selection_style()
 
@@ -732,6 +850,7 @@ class MindMapApp:
     def under_cursor(self, event):
         cx, cy = self.to_canvas(event)
         items = self.canvas.find_overlapping(cx - 1, cy - 1, cx + 1, cy + 1)
+        # prefer nodes over lines
         for item in reversed(items):
             tags = self.canvas.gettags(item)
             for t in tags:
@@ -754,7 +873,8 @@ class MindMapApp:
 
         if self.mode.get() == "add":
             self.select_clear()
-            nid = self.add_node(cx, cy)
+            with self.bulk_update():
+                nid = self.add_node(cx, cy)
             self.select_only_node(nid)
             return
 
@@ -769,7 +889,8 @@ class MindMapApp:
                         ax, ay, cx, cy, dash=(4, 2), fill="#999999", arrow=tk.LAST
                     )
                 else:
-                    self.connect_nodes(self.connect_start, nid)
+                    with self.bulk_update():
+                        self.connect_nodes(self.connect_start, nid)
                     if self.preview_line:
                         self.canvas.delete(self.preview_line)
                         self.preview_line = None
@@ -857,6 +978,9 @@ class MindMapApp:
                 bx1, by1, bx2, by2 = self.canvas.bbox(f"node_shape_{nid}")
                 if not (bx2 < x0 or bx1 > x1 or by2 < y0 or by1 > y1):
                     new_sel.add(nid)
+            # In clade mode, expand all nodes hit by box into their clades
+            if self.select_mode.get() == "clade":
+                new_sel = self._expand_to_clade(new_sel)
             self.selected_nodes |= new_sel
             self.refresh_selection_style()
             self.canvas.delete(self.box_rect_id)
@@ -883,7 +1007,9 @@ class MindMapApp:
         self.last_drag_pos = None
 
         if self.label_source.get() == "auto" and self._layout_moved:
-            self.request_rebuild()
+            for nid in self.selected_nodes:
+                self._mark_text_dirty(nid)
+            self.request_rebuild(all_nodes=False, text_only=True)
         self._layout_moved = False
 
         self.update_scrollregion()
@@ -903,41 +1029,46 @@ class MindMapApp:
                 display = self._display_from_newick(raw, new_text)
                 self.canvas.itemconfigure(self.nodes[nid]["text"], text=display)
                 self._text_cache[nid] = display
-                self.request_rebuild()
-                self.resize_node_to_text(nid)
+                self._measure_cache.clear()
+                self._mark_geom_dirty(nid)
+                self._mark_text_dirty(nid)
+                if self._bulk_depth == 0:
+                    self._flush_dirty()
 
     def on_right_click(self, event):
         target = self.under_cursor(event)
         if not target:
             return
-        if target[0] == "node":
-            nid = target[1]
-            if nid in self.selected_nodes and len(self.selected_nodes) > 1:
-                for dn in list(self.selected_nodes):
-                    if dn in self.nodes:
-                        self.delete_node(dn)
-                self.selected_nodes.clear()
+        with self.bulk_update():
+            if target[0] == "node":
+                nid = target[1]
+                if nid in self.selected_nodes and len(self.selected_nodes) > 1:
+                    for dn in list(self.selected_nodes):
+                        if dn in self.nodes:
+                            self.delete_node(dn)
+                    self.selected_nodes.clear()
+                else:
+                    self.delete_node(nid)
+                    self.selected_nodes.discard(nid)
             else:
-                self.delete_node(nid)
-                self.selected_nodes.discard(nid)
-        else:
-            lid = target[1]
-            self.delete_line(lid)
-            if self.selected_line == lid:
-                self.selected_line = None
-        self.refresh_selection_style()
+                lid = target[1]
+                self.delete_line(lid)
+                if self.selected_line == lid:
+                    self.selected_line = None
+            self.refresh_selection_style()
 
     def on_delete(self, event=None):
-        if self.selected_line:
-            self.delete_line(self.selected_line)
-            self.selected_line = None
-        elif self.selected_nodes:
-            for nid in list(self.selected_nodes):
-                if nid in self.nodes:
-                    self.delete_node(nid)
-            self.selected_nodes.clear()
-        self.refresh_selection_style()
-        self.update_scrollregion()
+        with self.bulk_update():
+            if self.selected_line and not self.selected_nodes:
+                self.delete_line(self.selected_line)
+                self.selected_line = None
+            elif self.selected_nodes:
+                for nid in list(self.selected_nodes):
+                    if nid in self.nodes:
+                        self.delete_node(nid)
+                self.selected_nodes.clear()
+            self.refresh_selection_style()
+            self.update_scrollregion()
 
     def on_escape(self, event):
         if self.preview_line:
@@ -949,6 +1080,7 @@ class MindMapApp:
 
     def on_motion(self, event):
         cx, cy = self.to_canvas(event)
+        self._last_mouse_canvas = (cx, cy)
         if self.mode.get() == "connect" and self.connect_start is not None and self.preview_line:
             ax, ay = self.node_anchor(self.connect_start, cx, cy)
             self.canvas.coords(self.preview_line, ax, ay, cx, cy)
@@ -965,16 +1097,16 @@ class MindMapApp:
         factor = 1.1 if event.delta > 0 else 1 / 1.1
         self.scale *= factor
         self.canvas.scale("all", cx, cy, factor, factor)
-        for lid, info in self.lines.items():
-            a_id, b_id = info["a"], info["b"]
-            bcx, bcy = self.node_center(b_id)
-            ax1, ay1 = self.node_anchor(a_id, bcx, bcy)
-            acx, acy = self.node_center(a_id)
-            bx1, by1 = self.node_anchor(b_id, acx, acy)
-            self.canvas.coords(lid, ax1, ay1, bx1, by1)
         self.update_scrollregion()
         self.label_zoom()
-        self.draw_grid()
+        if self._pending_zoom_job:
+            self.root.after_cancel(self._pending_zoom_job)
+        self._pending_zoom_job = self.root.after(ZOOM_RELINE_DELAY, self._post_zoom_refresh)
+        self._debounced_draw_grid()
+
+    def _post_zoom_refresh(self):
+        self._pending_zoom_job = None
+        self.update_connected_lines(self.nodes.keys())
 
     # ---------- Export helpers (Newick / Parent list) ----------
     def _stable_ids_and_labels(self):
@@ -1059,14 +1191,13 @@ class MindMapApp:
             out.append({"id": sid, "label": labels.get(sid, sid), "parent": parent_of[sid]})
         return out
 
-    def rebuild_all_node_newick(self):
-        if not self.nodes:
+    def _rebuild_nodes_text(self, node_ids):
+        if not node_ids:
             return
         id_map, labels = self._stable_ids_and_labels()
         children_map, parent_of, roots, _warnings = self._build_forest(id_map)
         subtree_map = self._to_newick_subtrees(children_map, labels)
 
-        # For component mode: map each sid to its component's full Newick
         component_map = None
         if self.label_mode.get() == "component":
             def find_root(u):
@@ -1082,9 +1213,10 @@ class MindMapApp:
                 r = find_root(sid)
                 component_map[sid] = root_str.get(r, subtree_map[sid])
 
-        # Update each node's display text to match detail + view, then resize
-        sid_to_nid = {sid: nid for nid, sid in id_map.items()}
-        for sid, nid in sid_to_nid.items():
+        for nid in node_ids:
+            sid = id_map.get(nid)
+            if not sid:
+                continue
             txt = component_map.get(sid) if (self.label_mode.get() == "component" and component_map is not None) else subtree_map.get(sid)
             if not txt:
                 continue
@@ -1092,8 +1224,8 @@ class MindMapApp:
             if self._text_cache.get(nid) != display:
                 self.canvas.itemconfigure(self.nodes[nid]["text"], text=display)
                 self._text_cache[nid] = display
-                if not self._bulk:
-                    self.resize_node_to_text(nid)
+                self._measure_cache.clear()
+                self._mark_geom_dirty(nid)
 
     # ----- Export / Import (JSON + Newick) -----
     def export_json(self):
@@ -1190,7 +1322,7 @@ class MindMapApp:
         else:
             self._import_newick_string(content)
 
-    def import_json(self):  # legacy entrypoint
+    def import_json(self):  # legacy
         path = filedialog.askopenfilename(
             filetypes=[("JSON files", "*.json"), ("All files", "*.*")], title="Open Mind Map (JSON)"
         )
@@ -1214,27 +1346,25 @@ class MindMapApp:
         nodes_in = data.get("nodes", [])
         edges_in = data.get("edges", [])
 
-        self.new_document(clear_only=True)
+        with self.bulk_update():
+            self.new_document(clear_only=True)
+            sid_to_nid = {}
+            for n in nodes_in:
+                sid = n.get("id")
+                x = float(n.get("x", 0))
+                y = float(n.get("y", 0))
+                text = n.get("text", None)
+                nid = self.add_node(x, y, text=text, bulk=True)
+                sid_to_nid[sid] = nid
+                if self.label_source.get() == "manual" and text is not None:
+                    self.manual_labels[nid] = text
 
-        sid_to_nid = {}
-        for n in nodes_in:
-            sid = n.get("id")
-            x = float(n.get("x", 0))
-            y = float(n.get("y", 0))
-            text = n.get("text", None)
-            nid = self.add_node(x, y, text=text)
-            sid_to_nid[sid] = nid
-            if self.label_source.get() == "manual" and text is not None:
-                self.manual_labels[nid] = text
+            for e in edges_in:
+                a_sid = e.get("from")
+                b_sid = e.get("to")
+                if a_sid in sid_to_nid and b_sid in sid_to_nid:
+                    self.connect_nodes(sid_to_nid[a_sid], sid_to_nid[b_sid])
 
-        for e in edges_in:
-            a_sid = e.get("from")
-            b_sid = e.get("to")
-            if a_sid in sid_to_nid and b_sid in sid_to_nid:
-                self.connect_nodes(sid_to_nid[a_sid], sid_to_nid[b_sid])
-
-        self.update_scrollregion()
-        self.request_rebuild()
         messagebox.showinfo("Import JSON", f"Imported {len(nodes_in)} nodes, {len(edges_in)} edges.")
 
     # ---------- Newick import (collision-free + bulk) ----------
@@ -1309,12 +1439,6 @@ class MindMapApp:
         level_gap=None,
         sibling_gap=40,
     ):
-        """
-        Compute non-overlapping positions for all Newick nodes using their
-        actual display sizes (detail+view + wrapped).
-        Returns: (positions dict, node_wh dict)
-        """
-        # Build subtree string for each node (like rebuild does)
         subtree_cache = {}
         def subtree_newick(n):
             if n in subtree_cache:
@@ -1327,7 +1451,6 @@ class MindMapApp:
             subtree_cache[n] = s
             return s
 
-        # Per-node target width/height based on actual *display* string
         node_wh = {}
         def node_target_wh(n):
             if n in node_wh:
@@ -1338,7 +1461,6 @@ class MindMapApp:
             node_wh[n] = (w, h)
             return w, h
 
-        # Compute subtree widths (sum of children + gaps; at least own box width)
         subtree_w = {}
         subtree_h = {}
         def compute_width(n):
@@ -1361,13 +1483,11 @@ class MindMapApp:
 
         compute_width(root)
 
-        # Dynamic vertical gap based on average node height if not specified
         if level_gap is None:
             all_h = [node_target_wh(n)[1] for n in subtree_w.keys()]
             avg_h = sum(all_h) / max(1, len(all_h))
             level_gap = int(avg_h * 1.2) + 40
 
-        # Assign positions centered above children
         positions = {}
         def layout(n, left, depth):
             total_w = subtree_w[n]
@@ -1392,7 +1512,6 @@ class MindMapApp:
             messagebox.showerror("Import Newick", f"Failed to parse Newick:\n{e}")
             return
 
-        # Build label map first; unnamed internals get A/B/C…
         def collect_labels(n, label_map):
             if n.name:
                 label_map[n] = n.name
@@ -1401,58 +1520,47 @@ class MindMapApp:
             for ch in n.children:
                 collect_labels(ch, label_map)
 
-        # Reset sequence for imports (comment out to keep running sequence)
         self.label_counter = 0
         label_map = {}
         collect_labels(root, label_map)
 
-        # Compute overlap-free positions using actual display sizes
         positions, node_wh = self._layout_tree_positions(root, label_map, x0=80, y0=80, sibling_gap=40)
 
-        # Bulk mode to avoid per-node rebuild thrash
-        self._bulk = True
-        self.new_document(clear_only=True)
-        self.label_source.set("manual")
+        with self.bulk_update():
+            self.new_document(clear_only=True)
+            self.label_source.set("manual")
 
-        # Create nodes in bulk
-        node_to_canvas = {}
-        for n, (x, y) in positions.items():
-            lbl = label_map[n]
-            nid = self.add_node(x, y, text=lbl, bulk=True)
-            node_to_canvas[n] = nid
-            self.manual_labels[nid] = lbl
+            node_to_canvas = {}
+            for n, (x, y) in positions.items():
+                lbl = label_map[n]
+                nid = self.add_node(x, y, text=lbl, bulk=True)
+                node_to_canvas[n] = nid
+                self.manual_labels[nid] = lbl
 
-        # Scale each node once to its target size
-        for n, nid in node_to_canvas.items():
-            w, h = node_wh[n]
-            bbox = self.canvas.bbox(f"node_shape_{nid}")
-            if not bbox:
-                continue
-            x1, y1, x2, y2 = bbox
-            cur_w = max(1.0, (x2 - x1))
-            cur_h = max(1.0, (y2 - y1))
-            cx = (x1 + x2) / 2.0
-            cy = (y1 + y2) / 2.0
-            sx = w / cur_w
-            sy = h / cur_h
-            if abs(sx - 1.0) > 0.01 or abs(sy - 1.0) > 0.01:
-                self.canvas.scale(f"node_shape_{nid}", cx, cy, sx, sy)
+            for n, nid in node_to_canvas.items():
+                w, h = node_wh[n]
+                bbox = self.canvas.bbox(f"node_shape_{nid}")
+                if not bbox:
+                    continue
+                x1, y1, x2, y2 = bbox
+                cur_w = max(1.0, (x2 - x1))
+                cur_h = max(1.0, (y2 - y1))
+                cx = (x1 + x2) / 2.0
+                cy = (y1 + y2) / 2.0
+                sx = w / cur_w
+                sy = h / cur_h
+                if abs(sx - 1.0) > 0.01 or abs(sy - 1.0) > 0.01:
+                    self.canvas.scale(f"node_shape_{nid}", cx, cy, sx, sy)
 
-        # Connect edges parent -> child (still in bulk)
-        for n in positions.keys():
-            for ch in n.children:
-                self.connect_nodes(node_to_canvas[n], node_to_canvas[ch])
+            for n in positions.keys():
+                for ch in n.children:
+                    self.connect_nodes(node_to_canvas[n], node_to_canvas[ch])
 
-        # One-shot updates
-        self.update_connected_lines(node_to_canvas.values())
-        self.update_scrollregion()
+            self.update_connected_lines(node_to_canvas.values())
 
-        # Turn off bulk, then align text wrap to final inner widths (cheap)
-        self._bulk = False
-        for nid in node_to_canvas.values():
-            self.resize_node_to_text(nid)
+            for nid in node_to_canvas.values():
+                self.resize_node_to_text(nid)
 
-        self.request_rebuild()  # re-render text with current detail/view
         messagebox.showinfo("Import Newick", "Imported Newick tree successfully.")
 
     # ---------- New / Rounded rect ----------
@@ -1461,6 +1569,9 @@ class MindMapApp:
         self.nodes.clear()
         self.lines.clear()
         self._text_cache.clear()
+        self._measure_cache.clear()
+        self._dirty_nodes_text.clear()
+        self._dirty_nodes_geom.clear()
         self.select_clear()
         self.connect_start = None
         self.preview_line = None
@@ -1469,11 +1580,14 @@ class MindMapApp:
         self.scale = 1.0
         self.label_counter = 0
         self.manual_labels.clear()
+        self._clipboard = None
+        self._last_paste_offset = (0, 0)
         self.label_zoom()
         self.update_scrollregion()
         self.draw_grid()
         if not clear_only:
-            nid = self.add_node(200, 150)
+            with self.bulk_update():
+                nid = self.add_node(200, 150)
             self.select_only_node(nid)
 
     def rounded_rect(self, x, y, w, h, r, **kwargs):
@@ -1501,6 +1615,162 @@ class MindMapApp:
         for i in parts + [body, left, right, top, bottom]:
             self.canvas.addtag_withtag(group_tag, i)
         return body
+
+    # ---------- Clipboard (Copy/Cut/Paste) ----------
+    def _current_selection_nodes(self):
+        """Return a set of node ids representing current selection, expanding to clades in clade mode."""
+        if self.selected_nodes:
+            if self.select_mode.get() == "clade":
+                return self._expand_to_clade(set(self.selected_nodes))
+            return set(self.selected_nodes)
+        # if no nodes, but an edge is selected, copy the edge + its endpoints
+        if self.selected_line and self.selected_line in self.lines:
+            a = self.lines[self.selected_line]["a"]
+            b = self.lines[self.selected_line]["b"]
+            return {a, b}
+        return set()
+
+    def _selection_edges_within(self, nset):
+        """Return edges (line ids) whose endpoints are both in nset."""
+        out = []
+        for lid, info in self.lines.items():
+            if info["a"] in nset and info["b"] in nset:
+                out.append(lid)
+        return out
+
+    def _node_label_raw(self, nid):
+        """Get a raw label to persist through copy/paste."""
+        if self.label_source.get() == "manual" and nid in self.manual_labels:
+            return self.manual_labels[nid]
+        # derive a raw label from current display (best-effort)
+        disp = self.canvas.itemcget(self.nodes[nid]["text"], "text")
+        return self._display_to_raw_label(disp)
+
+    def _build_clip_payload(self, nset, eset):
+        """Build a serializable clipboard payload with relative positions."""
+        if not nset:
+            return None
+        # base point: top-left of selection bbox
+        xmins = []
+        ymins = []
+        for nid in nset:
+            x1, y1, x2, y2 = self.canvas.bbox(f"node_shape_{nid}")
+            xmins.append((x1 + x2) / 2.0)
+            ymins.append((y1 + y2) / 2.0)
+        if not xmins:
+            return None
+        base_x = min(xmins)
+        base_y = min(ymins)
+
+        nodes_out = []
+        idx_map = {}  # nid -> index
+        for i, nid in enumerate(nset):
+            cx, cy = self.node_center(nid)
+            raw = self._node_label_raw(nid)
+            nodes_out.append({"label": raw, "dx": cx - base_x, "dy": cy - base_y})
+            idx_map[nid] = i
+
+        edges_out = []
+        for lid in eset:
+            a = self.lines[lid]["a"]
+            b = self.lines[lid]["b"]
+            if a in idx_map and b in idx_map:
+                edges_out.append({"from": idx_map[a], "to": idx_map[b]})
+
+        return {"base": (base_x, base_y), "nodes": nodes_out, "edges": edges_out}
+
+    def on_copy(self, event=None):
+        nset = self._current_selection_nodes()
+        if not nset:
+            messagebox.showinfo("Copy", "Nothing selected.")
+            return
+        eset = self._selection_edges_within(nset)
+        self._clipboard = self._build_clip_payload(nset, eset)
+        # Also prime Tk clipboard with a simple text for convenience (labels)
+        try:
+            labels = [self._node_label_raw(n) for n in nset]
+            self.root.clipboard_clear()
+            self.root.clipboard_append(", ".join(labels))
+        except Exception:
+            pass
+        messagebox.showinfo("Copy", f"Copied {len(nset)} node(s), {len(eset)} edge(s) to clipboard.")
+
+    def on_cut(self, event=None):
+        nset = self._current_selection_nodes()
+        if not nset and not self.selected_line:
+            messagebox.showinfo("Cut", "Nothing selected.")
+            return
+        # If only an edge is selected and no nodes, cut just that edge
+        if not nset and self.selected_line:
+            self._clipboard = None
+            # Copy a minimal payload of the edge + endpoints (for meaningful paste)
+            a = self.lines[self.selected_line]["a"]
+            b = self.lines[self.selected_line]["b"]
+            payload = self._build_clip_payload({a, b}, [self.selected_line])
+            self._clipboard = payload
+            self.delete_line(self.selected_line)
+            self.selected_line = None
+            messagebox.showinfo("Cut", "Cut 1 edge.")
+            return
+
+        eset = self._selection_edges_within(nset)
+        self._clipboard = self._build_clip_payload(nset, eset)
+        with self.bulk_update():
+            for nid in list(nset):
+                if nid in self.nodes:
+                    self.delete_node(nid)
+        self.select_clear()
+        messagebox.showinfo("Cut", f"Cut {len(nset)} node(s), {len(eset)} edge(s).")
+
+    def _paste_location(self):
+        if self._last_mouse_canvas is not None:
+            return self._last_mouse_canvas
+        x0, y0, x1, y1 = self.get_viewport()
+        return ((x0 + x1) / 2.0, (y0 + y1) / 2.0)
+
+    def on_paste(self, event=None):
+        if not self._clipboard:
+            messagebox.showinfo("Paste", "Clipboard is empty.")
+            return
+        clip = self._clipboard
+        base_x, base_y = clip["base"]
+        nodes = clip["nodes"]
+        edges = clip["edges"]
+
+        px, py = self._paste_location()
+        # nudge each subsequent paste
+        ox, oy = self._last_paste_offset
+        px += ox
+        py += oy
+        self._last_paste_offset = (ox + PASTE_NUDGE, oy + PASTE_NUDGE)
+
+        with self.bulk_update():
+            # create nodes
+            idx_to_canvas = {}
+            created = []
+            for i, nd in enumerate(nodes):
+                cx = px + nd["dx"]
+                cy = py + nd["dy"]
+                lbl = nd["label"]
+                nid = self.add_node(cx, cy, text=lbl, bulk=True)
+                idx_to_canvas[i] = nid
+                self.manual_labels[nid] = lbl  # paste as manual label
+                created.append(nid)
+            # create edges among pasted nodes
+            for e in edges:
+                a_idx = e["from"]
+                b_idx = e["to"]
+                if a_idx in idx_to_canvas and b_idx in idx_to_canvas:
+                    self.connect_nodes(idx_to_canvas[a_idx], idx_to_canvas[b_idx])
+            # finalize sizes/wraps and re-lines
+            for nid in created:
+                self.resize_node_to_text(nid)
+            self.update_connected_lines(created)
+
+        self.selected_nodes = set(idx_to_canvas.values())
+        self.selected_line = None
+        self.refresh_selection_style()
+        messagebox.showinfo("Paste", f"Pasted {len(nodes)} node(s), {len(edges)} edge(s).")
 
 
 # ---------- Canvas helper: create_round_rectangle ----------
