@@ -22,9 +22,9 @@ GRID_SIZE = 20
 GRID_COLOR = "#e2e8f0"  # light gray grid lines
 
 # Text layout inside nodes
-TEXT_MAX_WIDTH = 1000       # large so nodes can fit more text
-TEXT_PADDING_X = 20         # left/right padding inside the box
-TEXT_PADDING_Y = 12         # top/bottom padding inside the box
+TEXT_MAX_WIDTH = 1000
+TEXT_PADDING_X = 20
+TEXT_PADDING_Y = 12
 
 # Debounce delays (ms)
 GRID_REDRAW_DELAY = 40
@@ -33,11 +33,14 @@ ZOOM_RELINE_DELAY = 20
 # Nudge between sequential pastes
 PASTE_NUDGE = 20
 
+# Polynomial view formatting
+POLY_TERM_CAP = 60  # max terms to print in a bubble (prevents ultra-long labels)
+POLY_WRAP_STRATEGY = "smart"  # "smart" inserts soft breaks, "simple" leaves as-is
 
 class MindMapApp:
     def __init__(self, root):
         self.root = root
-        root.title("Mind Map (Tkinter)")
+        root.title("PhyloTree (Tkinter)")
         root.geometry("1200x760")
 
         self.mode = tk.StringVar(value="select")          # 'select', 'add', 'connect'
@@ -47,40 +50,37 @@ class MindMapApp:
         self.snap_var = tk.BooleanVar(value=False)
         self.scale = 1.0
 
-        # Newick export mode: forest (list) or combined (single super-root)
         self.newick_export = tk.StringVar(value="forest")  # 'forest' or 'combined'
-        # Newick view mode (applied after detail transform)
         self.newick_view = tk.StringVar(value="pretty")    # 'compact' or 'pretty'
 
-        # Display detail (what each node shows)
+        # Display detail (includes Tree polynomial)
         self.display_detail = tk.StringVar(value="Subtree (pretty)")
-        # Global node scale multiplier (applied after text fit)
-        self.node_scale = tk.DoubleVar(value=1.2)          # try 1.2–1.6
+        self.node_scale = tk.DoubleVar(value=1.2)
 
-        # Font for labels (used to measure text)
+        # ---- New: live Tree polynomial font size toggle (Small/Medium/Large)
+        self.poly_font_choice = tk.StringVar(value="Medium")  # "Small" | "Medium" | "Large"
+        self._poly_font_sizes = {"Small": 9, "Medium": 10, "Large": 12}
+
+        # Fonts
         self.text_font = tkfont.Font(family="Segoe UI", size=11, weight="bold")
+        self.poly_font = tkfont.Font(family="Segoe UI", size=self._poly_font_sizes[self.poly_font_choice.get()], weight="normal")
 
-        # Label counters & storage
-        self.label_counter = 0                # next label index (A,B,...)
-        self.manual_labels = {}               # canvas node id -> manual label (raw)
+        self.label_counter = 0
+        self.manual_labels = {}
 
-        # Rebuild throttling & caches
         self._rebuild_scheduled = False
-        self._text_cache = {}                 # node_id -> last displayed text
-        self._measure_cache = {}              # (display, scale, font_sig) -> (w,h)
+        self._text_cache = {}
+        self._measure_cache = {}
         self._layout_moved = False
 
-        # Dirty sets (what to recompute)
-        self._dirty_nodes_text = set()        # nodes needing text/display refresh
-        self._dirty_nodes_geom = set()        # nodes needing resize to text
-        self._graph_version = 0               # bump when edges change (invalidates subtree cache)
+        self._dirty_nodes_text = set()
+        self._dirty_nodes_geom = set()
+        self._graph_version = 0
 
-        # Bulk / debouncing
         self._bulk_depth = 0
         self._pending_grid_job = None
         self._pending_zoom_job = None
 
-        # Clipboard
         self._clipboard = None
         self._last_paste_offset = (0, 0)
         self._last_mouse_canvas = None
@@ -97,18 +97,29 @@ class MindMapApp:
         filemenu.add_command(label="Exit", command=root.quit)
         menubar.add_cascade(label="File", menu=filemenu)
 
-        # Help menu (Tips + About)
+        # Help menu (Tips + About + NEW: Polynomial font size submenu)
         helpmenu = tk.Menu(menubar, tearoff=False)
         helpmenu.add_command(label="Tips", command=self.show_tips)
+        # ---- Submenu for Tree polynomial font size
+        poly_sub = tk.Menu(helpmenu, tearoff=False)
+        for label in ("Small", "Medium", "Large"):
+            poly_sub.add_radiobutton(
+                label=label,
+                variable=self.poly_font_choice,
+                value=label,
+                command=self.on_poly_font_change
+            )
+        helpmenu.add_cascade(label="Tree polynomial font size", menu=poly_sub)
         helpmenu.add_separator()
         helpmenu.add_command(
             label="About",
             command=lambda: messagebox.showinfo(
                 "About",
-                "Mind Map (Tkinter)\n\nJSON & Newick import • Forest/Combined Newick export\n"
+                "PhyloTree (Tkinter)\n\nJSON & Newick import • Forest/Combined Newick export\n"
                 "Autosize • Pan/Zoom • Multiselect • Snap grid • Label source/scope\n"
-                "Pretty/Compact/Depth display • Collision-free Newick import\n"
-                "Copy/Cut/Paste • Selection mode: Single / Clade"
+                "Pretty/Compact/Depth/Tree polynomial display • Collision-aware Newick import\n"
+                "Copy/Cut/Paste • Selection mode: Single / Clade\n"
+                "Live polynomial font size toggle (Help → Tree polynomial font size)"
             )
         )
         menubar.add_cascade(label="Help", menu=helpmenu)
@@ -151,12 +162,12 @@ class MindMapApp:
         mode_cb.pack(side=tk.LEFT)
         mode_cb.bind("<<ComboboxSelected>>", lambda e: self.request_rebuild(all_nodes=False, text_only=True))
 
-        # --- Display detail selector ---
+        # --- Display detail selector (now includes "Tree polynomial") ---
         ttk.Separator(bar, orient=tk.VERTICAL).pack(side=tk.LEFT, fill=tk.Y, padx=8)
         ttk.Label(bar, text="Display:").pack(side=tk.LEFT, padx=(0, 4))
         detail_cb = ttk.Combobox(
-            bar, state="readonly", width=16,
-            values=["Label only", "Subtree (compact)", "Subtree (pretty)", "Depth 1", "Depth 2"],
+            bar, state="readonly", width=20,
+            values=["Label only", "Subtree (compact)", "Subtree (pretty)", "Depth 1", "Depth 2", "Tree polynomial"],
             textvariable=self.display_detail
         )
         detail_cb.pack(side=tk.LEFT)
@@ -198,13 +209,13 @@ class MindMapApp:
         self.selected_nodes = set()
         self.selected_line = None
         self.dragging = False
-        self.drag_offset = (0, 0)   # for single-node drag
-        self.last_drag_pos = None   # for multi-drag
+        self.drag_offset = (0, 0)
+        self.last_drag_pos = None
         self.connect_start = None
         self.preview_line = None
 
         # Rubber-band (Ctrl+drag)
-        self.box_select_start = None  # (cx, cy)
+        self.box_select_start = None
         self.box_rect_id = None
 
         # Bindings
@@ -220,7 +231,7 @@ class MindMapApp:
         self.canvas.bind("<B2-Motion>", self.on_mid_drag)
         self.canvas.bind("<ButtonRelease-2>", self._debounced_draw_grid)
 
-        # Zoom (Ctrl + Mouse Wheel)
+        # Zoom (Ctrl + Mouse Wheel) — scale only geometry, not text
         root.bind("<Control-MouseWheel>", self.on_zoom)
 
         # Keyboard
@@ -228,6 +239,9 @@ class MindMapApp:
         root.bind("<Delete>", self.on_delete)
         root.bind("<Escape>", self.on_escape)
         root.bind("<Control-a>", self.select_all)
+
+        # Polynomial cache (per node sid when building text)
+        self._poly_cache = None  # will be dict sid -> poly
 
         # Setup helpers
         add_round_rect_to_canvas(self.canvas)
@@ -237,7 +251,6 @@ class MindMapApp:
     # ---------- Utility / batching ----------
     @contextmanager
     def bulk_update(self):
-        """Group many edits into one repaint/rebuild pass."""
         self._bulk_depth += 1
         try:
             yield
@@ -287,12 +300,29 @@ class MindMapApp:
             " • Grid appears only when snapping is on\n\n"
             "Pan / Zoom:\n"
             " • Middle-mouse drag to pan\n"
-            " • Ctrl+MouseWheel to zoom (focus around cursor)\n\n"
+            " • Ctrl+MouseWheel to zoom (labels don’t scale)\n\n"
             "Display:\n"
-            " • Display detail condenses nodes: Label only / Depth / Subtree\n"
-            " • Node scale globally enlarges boxes after text-fit\n"
+            " • Choose Label/Newick/Depth/Tree polynomial in the Display menu\n"
+            " • Node scale globally enlarges boxes after text-fit\n\n"
+            "Polynomial font size:\n"
+            " • Help → Tree polynomial font size → Small/Medium/Large\n"
+            " • Changes wrap and node size immediately when 'Tree polynomial' display is active\n"
         )
         messagebox.showinfo("Tips", tips)
+
+    # ---- NEW: change Tree polynomial font size on the fly
+    def on_poly_font_change(self):
+        size_pt = self._poly_font_sizes.get(self.poly_font_choice.get(), 10)
+        # Rebuild font object (safer than configure across platforms)
+        self.poly_font = tkfont.Font(family="Segoe UI", size=size_pt, weight="normal")
+        # Invalidate measurements and resize nodes showing polynomials
+        self._measure_cache.clear()
+        # Mark all nodes text/geom dirty if polynomial view is active
+        if self.display_detail.get() == "Tree polynomial":
+            self._dirty_nodes_text |= set(self.nodes.keys())
+            self._dirty_nodes_geom |= set(self.nodes.keys())
+            if self._bulk_depth == 0:
+                self._flush_dirty()
 
     # ---------- Rebuild throttling ----------
     def request_rebuild(self, all_nodes=False, text_only=False):
@@ -301,7 +331,6 @@ class MindMapApp:
         else:
             if not self._dirty_nodes_text:
                 self._dirty_nodes_text |= set(self.nodes.keys())
-
         if not self._rebuild_scheduled and self._bulk_depth == 0:
             self._rebuild_scheduled = True
             self.root.after_idle(self._do_rebuild)
@@ -364,9 +393,9 @@ class MindMapApp:
         start_y = math.floor(y0 / GRID_SIZE) * GRID_SIZE
         end_y   = math.ceil(y1 / GRID_SIZE) * GRID_SIZE
         for x in range(int(start_x), int(end_x + 1), GRID_SIZE):
-            self.canvas.create_line(x, y0, x, y1, fill=GRID_COLOR, width=1, tags=("grid",))
+            self.canvas.create_line(x, y0, x, y1, fill=GRID_COLOR, width=1, tags=("grid", "scalable"))
         for y in range(int(start_y), int(end_y + 1), GRID_SIZE):
-            self.canvas.create_line(x0, y, x1, y, fill=GRID_COLOR, width=1, tags=("grid",))
+            self.canvas.create_line(x0, y, x1, y, fill=GRID_COLOR, width=1, tags=("grid", "scalable"))
         self.canvas.tag_lower("grid")
 
     # ---------- Coordinate helpers ----------
@@ -533,46 +562,66 @@ class MindMapApp:
             s = self._limit_newick_depth(newick_str, 2) + ";"
         elif detail == "Subtree (compact)":
             s = newick_str
+        elif detail == "Tree polynomial":
+            s = newick_str  # text computed elsewhere; this branch just avoids pretty formatting here
         else:  # "Subtree (pretty)"
             s = newick_str
 
-        if self.newick_view.get() == "pretty" and detail != "Subtree (compact)":
+        if self.newick_view.get() == "pretty" and detail not in ("Subtree (compact)", "Tree polynomial"):
             return self._pretty_newick(s)
         return s
 
     # ---------- Text measuring + node sizing (cached) ----------
-    def _font_signature(self):
-        return (self.text_font.actual("family"),
-                self.text_font.actual("size"),
-                self.text_font.actual("weight"))
+    def _font_signature(self, font_obj):
+        return (font_obj.actual("family"),
+                font_obj.actual("size"),
+                font_obj.actual("weight"))
 
     def _measure_display_str_wh(self, display_text: str,
                                 max_text_w=TEXT_MAX_WIDTH,
                                 pad_x=TEXT_PADDING_X,
                                 pad_y=TEXT_PADDING_Y,
                                 min_w=NODE_WIDTH,
-                                min_h=NODE_HEIGHT):
-        key = (display_text, round(float(self.node_scale.get()), 3), self._font_signature())
+                                min_h=NODE_HEIGHT,
+                                font_obj=None):
+        font_obj = font_obj or self.text_font
+        key = (display_text, round(float(self.node_scale.get()), 3), self._font_signature(font_obj))
         if key in self._measure_cache:
             w, h = self._measure_cache[key]
             return w, h
 
-        tokens = re.findall(r"[^\s,()]+|[(),]", display_text)
-        lines = []
-        cur = ""
-        for tok in tokens:
-            sep = "" if (not cur or tok in "(),") else " "
-            probe = cur + sep + tok
-            if self.text_font.measure(probe) <= max_text_w or not cur:
-                cur = probe
-            else:
+        # Break long strings on " + " or "*"
+        if POLY_WRAP_STRATEGY == "smart" and self.display_detail.get() == "Tree polynomial":
+            tokens = re.split(r'(\s*\+\s+)', display_text)
+            lines = []
+            cur = ""
+            for tok in tokens:
+                probe = (cur + tok) if cur else tok
+                if font_obj.measure(probe) <= max_text_w or not cur:
+                    cur = probe
+                else:
+                    if cur:
+                        lines.append(cur.rstrip())
+                    cur = tok.lstrip()
+            if cur:
+                lines.append(cur.rstrip())
+        else:
+            tokens = re.findall(r"[^\s,()]+|[(),]", display_text)
+            lines = []
+            cur = ""
+            for tok in tokens:
+                sep = "" if (not cur or tok in "(),") else " "
+                probe = cur + sep + tok
+                if font_obj.measure(probe) <= max_text_w or not cur:
+                    cur = probe
+                else:
+                    lines.append(cur)
+                    cur = tok
+            if cur:
                 lines.append(cur)
-                cur = tok
-        if cur:
-            lines.append(cur)
 
-        line_h = self.text_font.metrics("linespace")
-        text_w = min(max_text_w, max(self.text_font.measure(L) for L in (lines or [""])))
+        line_h = font_obj.metrics("linespace")
+        text_w = min(max_text_w, max(font_obj.measure(L) for L in (lines or [""])))
         text_h = max(line_h, line_h * max(1, len(lines)))
 
         target_w = max(min_w, pad_x * 2 + text_w)
@@ -602,12 +651,16 @@ class MindMapApp:
         x1, y1, x2, y2 = bbox
         cur_w = max(1.0, (x2 - x1))
 
+        # choose font per current display mode
+        use_font = self.poly_font if self.display_detail.get() == "Tree polynomial" else self.text_font
+
         wrap_w = max(1, int(min(max_text_w, cur_w - 2 * pad_x)))
-        self.canvas.itemconfigure(text_id, width=wrap_w, justify="center", anchor="center")
+        self.canvas.itemconfigure(text_id, width=wrap_w, justify="center", anchor="center", font=use_font)
 
         display_text = self.canvas.itemcget(text_id, "text")
         target_w, target_h = self._measure_display_str_wh(
-            display_text, max_text_w=max_text_w, pad_x=pad_x, pad_y=pad_y, min_w=min_w, min_h=min_h
+            display_text, max_text_w=max_text_w, pad_x=pad_x, pad_y=pad_y,
+            min_w=min_w, min_h=min_h, font_obj=use_font
         )
 
         cx = (x1 + x2) / 2.0
@@ -624,7 +677,9 @@ class MindMapApp:
         nx1, ny1, nx2, ny2 = nb
         final_inner_w = max(1, int(nx2 - nx1 - 2 * pad_x))
         final_wrap_w = max(1, int(min(max_text_w, final_inner_w)))
-        self.canvas.itemconfigure(text_id, width=final_wrap_w)
+        self.canvas.itemconfigure(text_id, width=final_wrap_w, font=use_font)
+
+        self.canvas.coords(text_id, (nx1 + nx2) / 2.0, (ny1 + ny2) / 2.0)
 
         self._update_lines_for_nodes({nid})
 
@@ -658,12 +713,17 @@ class MindMapApp:
         rect = self.rounded_rect(
             x, y, NODE_WIDTH, NODE_HEIGHT, NODE_RADIUS, fill=NODE_FILL, outline=NODE_OUTLINE, width=2
         )
+        # tag scalable geometry (shapes)
+        self.canvas.addtag_withtag("scalable", rect)
+
         if text is None:
             text = self._next_alpha_label()
 
         raw_newick = f"{self._newick_label(text)};"
         display = self._display_from_newick(raw_newick, text)
         label = self.canvas.create_text(x, y, text=display, fill=NODE_TEXT, font=self.text_font)
+        self.canvas.addtag_withtag("node_text", label)
+
         node_id = rect
 
         tag_all = f"node_{node_id}"
@@ -673,6 +733,7 @@ class MindMapApp:
         for part in self.canvas.find_withtag(f"roundrect_{rect}"):
             self.canvas.addtag_withtag(tag_all, part)
             self.canvas.addtag_withtag(tag_shape, part)
+            self.canvas.addtag_withtag("scalable", part)
         self.canvas.addtag_withtag(tag_all, label)
 
         self.nodes[node_id] = {"rect": rect, "text": label, "lines": set()}
@@ -687,6 +748,13 @@ class MindMapApp:
             self._flush_dirty()
         return node_id
 
+    # ---- Topology-change hook ----
+    def _on_graph_changed(self):
+        """Call whenever edges/nodes change the topology."""
+        self._graph_version += 1
+        # Rebuild all node labels because subtree / component / polynomial depend on ancestors
+        self.request_rebuild(all_nodes=True)
+
     def connect_nodes(self, a_id, b_id):
         if a_id == b_id:
             return None
@@ -697,13 +765,14 @@ class MindMapApp:
         line = self.canvas.create_line(
             ax1, ay1, bx1, by1, width=LINE_WIDTH, fill=LINE_COLOR, capstyle=tk.ROUND, arrow=tk.LAST
         )
+        self.canvas.addtag_withtag("scalable", line)
+
         self.lines[line] = {"a": a_id, "b": b_id}
         self.nodes[a_id]["lines"].add(line)
         self.nodes[b_id]["lines"].add(line)
 
-        self._graph_version += 1
-        self._mark_text_dirty(a_id)
-        self._mark_text_dirty(b_id)
+        # Topology changed: refresh labels (including tree polynomial)
+        self._on_graph_changed()
 
         if self._bulk_depth == 0:
             self._flush_dirty()
@@ -735,11 +804,8 @@ class MindMapApp:
             del self.nodes[node_id]
             self._text_cache.pop(node_id, None)
             self.manual_labels.pop(node_id, None)
-            self._graph_version += 1
-            for lid in list(self.lines.keys()):
-                info = self.lines[lid]
-                self._mark_text_dirty(info["a"])
-                self._mark_text_dirty(info["b"])
+            # Topology changed
+            self._on_graph_changed()
 
     def delete_line(self, line_id, suppress_rebuild=False):
         if line_id not in self.lines:
@@ -752,12 +818,14 @@ class MindMapApp:
             self.nodes[b]["lines"].discard(line_id)
         self.canvas.delete(line_id)
         del self.lines[line_id]
-        self._graph_version += 1
-        if not suppress_rebuild:
-            self._mark_text_dirty(a)
-            self._mark_text_dirty(b)
-            if self._bulk_depth == 0:
-                self._flush_dirty()
+
+        if suppress_rebuild:
+            return
+
+        # Topology changed
+        self._on_graph_changed()
+        if self._bulk_depth == 0:
+            self._flush_dirty()
 
     # ---------- Selection helpers ----------
     def clear_styles(self):
@@ -779,18 +847,24 @@ class MindMapApp:
         self.refresh_selection_style()
 
     # --- children map & clade expansion ---
-    def _children_map(self):
-        """Return dict canvas_nid -> list(child_canvas_nid)."""
-        cmap = {nid: [] for nid in self.nodes.keys()}
-        for lid, info in self.lines.items():
-            a, b = info["a"], info["b"]  # a -> b
-            if a in cmap:
-                cmap[a].append(b)
-        return cmap
+    def _children_map(self, id_map=None):
+        """Return dict sid -> list(child_sid) derived from self.lines (parent->child)."""
+        if id_map is None:
+            id_map = {nid: f"n{i+1}" for i, nid in enumerate(self.nodes.keys())}
+        children_map = {sid: [] for sid in id_map.values()}
+        for _, info in self.lines.items():
+            a, b = info["a"], info["b"]
+            a_sid = id_map.get(a); b_sid = id_map.get(b)
+            if a_sid and b_sid and a_sid != b_sid:
+                children_map[a_sid].append(b_sid)
+        return children_map
 
-    def _descendants(self, nid, cmap=None):
-        if cmap is None:
-            cmap = self._children_map()
+    def _descendants(self, nid, cmap_canvas=None):
+        if cmap_canvas is None:
+            # build canvas-ids map (not sids)
+            cmap_canvas = {nid: [] for nid in self.nodes.keys()}
+            for _, info in self.lines.items():
+                cmap_canvas[info["a"]].append(info["b"])
         out = set()
         stack = [nid]
         seen = set()
@@ -800,12 +874,14 @@ class MindMapApp:
                 continue
             seen.add(u)
             out.add(u)
-            for v in cmap.get(u, []):
+            for v in cmap_canvas.get(u, []):
                 stack.append(v)
         return out
 
     def _expand_to_clade(self, nids):
-        cmap = self._children_map()
+        cmap = {nid: [] for nid in self.nodes.keys()}
+        for _, info in self.lines.items():
+            cmap[info["a"]].append(info["b"])
         out = set()
         for nid in nids:
             out |= self._descendants(nid, cmap)
@@ -838,11 +914,7 @@ class MindMapApp:
         self.refresh_selection_style()
 
     def select_all(self, event=None):
-        if self.select_mode.get() == "clade":
-            # in clade mode, Ctrl+A still selects all nodes
-            self.selected_nodes = set(self.nodes.keys())
-        else:
-            self.selected_nodes = set(self.nodes.keys())
+        self.selected_nodes = set(self.nodes.keys())
         self.selected_line = None
         self.refresh_selection_style()
 
@@ -886,7 +958,7 @@ class MindMapApp:
                     self.select_only_node(nid)
                     ax, ay = self.node_anchor(nid, cx, cy)
                     self.preview_line = self.canvas.create_line(
-                        ax, ay, cx, cy, dash=(4, 2), fill="#999999", arrow=tk.LAST
+                        ax, ay, cx, cy, dash=(4, 2), fill="#999999", arrow=tk.LAST, tags=("scalable",)
                     )
                 else:
                     with self.bulk_update():
@@ -978,7 +1050,6 @@ class MindMapApp:
                 bx1, by1, bx2, by2 = self.canvas.bbox(f"node_shape_{nid}")
                 if not (bx2 < x0 or bx1 > x1 or by2 < y0 or by1 > y1):
                     new_sel.add(nid)
-            # In clade mode, expand all nodes hit by box into their clades
             if self.select_mode.get() == "clade":
                 new_sel = self._expand_to_clade(new_sel)
             self.selected_nodes |= new_sel
@@ -1027,7 +1098,9 @@ class MindMapApp:
                 self.manual_labels[nid] = new_text
                 raw = f"{self._newick_label(new_text)};"
                 display = self._display_from_newick(raw, new_text)
-                self.canvas.itemconfigure(self.nodes[nid]["text"], text=display)
+                # font selection stays based on display mode
+                use_font = self.poly_font if self.display_detail.get() == "Tree polynomial" else self.text_font
+                self.canvas.itemconfigure(self.nodes[nid]["text"], text=display, font=use_font)
                 self._text_cache[nid] = display
                 self._measure_cache.clear()
                 self._mark_geom_dirty(nid)
@@ -1096,7 +1169,15 @@ class MindMapApp:
         cx, cy = self.to_canvas(event)
         factor = 1.1 if event.delta > 0 else 1 / 1.1
         self.scale *= factor
-        self.canvas.scale("all", cx, cy, factor, factor)
+        # Scale only geometry (shapes/lines/grid), not text
+        self.canvas.scale("scalable", cx, cy, factor, factor)
+
+        # Re-center text on scaled boxes
+        for nid, node in self.nodes.items():
+            tx = node["text"]
+            cxn, cyn = self.node_center(nid)
+            self.canvas.coords(tx, cxn, cyn)
+
         self.update_scrollregion()
         self.label_zoom()
         if self._pending_zoom_job:
@@ -1107,6 +1188,108 @@ class MindMapApp:
     def _post_zoom_refresh(self):
         self._pending_zoom_job = None
         self.update_connected_lines(self.nodes.keys())
+
+    # ---------- Bivariate polynomial (Liu) helpers ----------
+    # Represent polynomials as {(a,b): coeff} for x^a y^b
+    @staticmethod
+    def _p_zero():
+        return {}
+
+    @staticmethod
+    def _p_monom(ax, ay, c=1):
+        return {(ax, ay): c} if c else {}
+
+    @staticmethod
+    def _p_add(p, q):
+        out = dict(p)
+        for k, v in q.items():
+            out[k] = out.get(k, 0) + v
+            if out[k] == 0:
+                del out[k]
+        return out
+
+    @staticmethod
+    def _p_mul(p, q):
+        if not p or not q:
+            return {}
+        out = {}
+        for (ax, ay), c1 in p.items():
+            for (bx, by), c2 in q.items():
+                k = (ax + bx, ay + by)
+                out[k] = out.get(k, 0) + c1 * c2
+        return {k: v for k, v in out.items() if v}
+
+    @staticmethod
+    def _p_to_string(p, max_terms=None):
+        if not p:
+            return "0"
+        items = [ (a+b, a, b, c) for (a,b), c in p.items() if c != 0 ]
+        items.sort(key=lambda t: (-t[0], -t[1], t[2]))
+        parts = []
+        count = 0
+        for _, a, b, c in items:
+            if max_terms and count >= max_terms:
+                parts.append(" + …")
+                break
+            # coefficient string
+            if c == 1:
+                coeff = "" if (a != 0 or b != 0) else "1"
+            elif c == -1:
+                coeff = "-" if (a != 0 or b != 0) else "-1"
+            else:
+                coeff = str(c)
+            # power formatting
+            def pwr(sym, e):
+                if e == 0: return ""
+                if e == 1: return sym
+                return f"{sym}^{e}"
+            term_xy = "*".join([t for t in (pwr("x", a), pwr("y", b)) if t])
+            if coeff and term_xy:
+                parts.append(f"{coeff}{('*' if coeff not in ('','-') else '')}{term_xy}")
+            elif coeff and not term_xy:
+                parts.append(coeff)
+            else:
+                parts.append(term_xy or "1")
+            count += 1
+        return " + ".join(parts).replace("+ -", "- ")
+
+    def _compute_liu_polynomials(self, children_map):
+        """
+        Compute Liu tree-distinguishing polynomial for each sid in forest:
+        leaf -> x ; internal -> y + Π child P(child)
+        Returns dict sid -> poly
+        """
+        X = self._p_monom(1, 0, 1)
+        Y = self._p_monom(0, 1, 1)
+
+        visited = set()
+        order = []
+
+        def dfs(u):
+            if u in visited:
+                return
+            visited.add(u)
+            for v in children_map.get(u, []):
+                dfs(v)
+            order.append(u)
+
+        for u in children_map.keys():
+            dfs(u)
+
+        F = {}
+        for u in order:
+            kids = children_map.get(u, [])
+            if not kids:
+                F[u] = X
+            else:
+                prod = None
+                for v in kids:
+                    if prod is None:
+                        prod = F[v]
+                    else:
+                        prod = self._p_mul(prod, F[v])
+                F[u] = self._p_add(Y, prod if prod is not None else self._p_zero())
+        return F
 
     # ---------- Export helpers (Newick / Parent list) ----------
     def _stable_ids_and_labels(self):
@@ -1136,7 +1319,7 @@ class MindMapApp:
         parent_of = {sid: None for sid in id_map.values()}
         indeg = {sid: 0 for sid in id_map.values()}
         warnings = []
-        for lid, info in self.lines.items():
+        for _, info in self.lines.items():
             a_sid = id_map.get(info["a"])
             b_sid = id_map.get(info["b"])
             if not a_sid or not b_sid or a_sid == b_sid:
@@ -1198,6 +1381,11 @@ class MindMapApp:
         children_map, parent_of, roots, _warnings = self._build_forest(id_map)
         subtree_map = self._to_newick_subtrees(children_map, labels)
 
+        # Polynomial map for each sid if needed
+        poly_map = None
+        if self.display_detail.get() == "Tree polynomial":
+            poly_map = self._compute_liu_polynomials(children_map)
+
         component_map = None
         if self.label_mode.get() == "component":
             def find_root(u):
@@ -1213,16 +1401,29 @@ class MindMapApp:
                 r = find_root(sid)
                 component_map[sid] = root_str.get(r, subtree_map[sid])
 
+        poly_mode = (self.display_detail.get() == "Tree polynomial")
+
         for nid in node_ids:
             sid = id_map.get(nid)
             if not sid:
                 continue
-            txt = component_map.get(sid) if (self.label_mode.get() == "component" and component_map is not None) else subtree_map.get(sid)
-            if not txt:
-                continue
-            display = self._display_from_newick(txt, labels.get(sid))
-            if self._text_cache.get(nid) != display:
-                self.canvas.itemconfigure(self.nodes[nid]["text"], text=display)
+
+            if poly_mode:
+                p = poly_map.get(sid, {(1,0):1})  # default x if missing
+                display = self._p_to_string(p, max_terms=POLY_TERM_CAP)
+                # switch font for polynomial
+                use_font = self.poly_font
+            else:
+                txt = (component_map.get(sid)
+                       if (self.label_mode.get() == "component" and component_map is not None)
+                       else subtree_map.get(sid))
+                if not txt:
+                    continue
+                display = self._display_from_newick(txt, labels.get(sid))
+                use_font = self.text_font
+
+            if self._text_cache.get(nid) != display or (self.canvas.itemcget(self.nodes[nid]["text"], "font") != str(use_font)):
+                self.canvas.itemconfigure(self.nodes[nid]["text"], text=display, font=use_font)
                 self._text_cache[nid] = display
                 self._measure_cache.clear()
                 self._mark_geom_dirty(nid)
@@ -1238,7 +1439,7 @@ class MindMapApp:
             cx, cy = self.node_center(canvas_id)
             text = labels[sid]
             data["nodes"].append({"id": sid, "x": cx, "y": cy, "text": text})
-        for lid, info in self.lines.items():
+        for _, info in self.lines.items():
             a_sid = id_map.get(info["a"])
             b_sid = id_map.get(info["b"])
             if a_sid and b_sid and a_sid != b_sid:
@@ -1276,7 +1477,7 @@ class MindMapApp:
         path = filedialog.asksaveasfilename(
             defaultextension=".json",
             filetypes=[("JSON files", "*.json"), ("All files", "*.*")],
-            title="Save Mind Map As",
+            title="Save PhyloTree As",
         )
         if not path:
             return
@@ -1293,7 +1494,7 @@ class MindMapApp:
 
     def import_any(self):
         path = filedialog.askopenfilename(
-            title="Open Mind Map",
+            title="Open PhyloTree",
             filetypes=[
                 ("Mind Map JSON", "*.json"),
                 ("Newick", "*.newick *.nwk *.txt"),
@@ -1322,9 +1523,9 @@ class MindMapApp:
         else:
             self._import_newick_string(content)
 
-    def import_json(self):  # legacy
+    def import_json(self):  # legacy shortcut
         path = filedialog.askopenfilename(
-            filetypes=[("JSON files", "*.json"), ("All files", "*.*")], title="Open Mind Map (JSON)"
+            filetypes=[("JSON files", "*.json"), ("All files", "*.*")], title="Open PhyloTree (JSON)"
         )
         if not path:
             return
@@ -1367,7 +1568,7 @@ class MindMapApp:
 
         messagebox.showinfo("Import JSON", f"Imported {len(nodes_in)} nodes, {len(edges_in)} edges.")
 
-    # ---------- Newick import (collision-free + bulk) ----------
+    # ---------- Newick import (collision-aware layout) ----------
     class _NWKNode:
         __slots__ = ("name", "children")
         def __init__(self, name=""):
@@ -1457,7 +1658,8 @@ class MindMapApp:
                 return node_wh[n]
             s = subtree_newick(n)
             display = self._display_from_newick(s, label_map[n])
-            w, h = self._measure_display_str_wh(display, min_w=min_w, min_h=min_h, pad_x=pad_x, pad_y=pad_y)
+            font_obj = self.poly_font if self.display_detail.get() == "Tree polynomial" else self.text_font
+            w, h = self._measure_display_str_wh(display, min_w=min_w, min_h=min_h, pad_x=pad_x, pad_y=pad_y, font_obj=font_obj)
             node_wh[n] = (w, h)
             return w, h
 
@@ -1551,6 +1753,7 @@ class MindMapApp:
                 sy = h / cur_h
                 if abs(sx - 1.0) > 0.01 or abs(sy - 1.0) > 0.01:
                     self.canvas.scale(f"node_shape_{nid}", cx, cy, sx, sy)
+                self.canvas.coords(self.nodes[nid]["text"], cx, cy)
 
             for n in positions.keys():
                 for ch in n.children:
@@ -1572,7 +1775,8 @@ class MindMapApp:
         self._measure_cache.clear()
         self._dirty_nodes_text.clear()
         self._dirty_nodes_geom.clear()
-        self.select_clear()
+        self.selected_nodes.clear()
+        self.selected_line = None
         self.connect_start = None
         self.preview_line = None
         self.box_select_start = None
@@ -1582,6 +1786,7 @@ class MindMapApp:
         self.manual_labels.clear()
         self._clipboard = None
         self._last_paste_offset = (0, 0)
+        self._poly_cache = None
         self.label_zoom()
         self.update_scrollregion()
         self.draw_grid()
@@ -1594,7 +1799,8 @@ class MindMapApp:
         x1, y1 = x - w / 2, y - h / 2
         x2, y2 = x + w / 2, y + h / 2
         if hasattr(self.canvas.__class__, "create_round_rectangle"):
-            return self.canvas.create_round_rectangle(x1, y1, x2, y2, r=r, **kwargs)
+            rid = self.canvas.create_round_rectangle(x1, y1, x2, y2, r=r, **kwargs)
+            return rid
         return self._fallback_round_rect(x1, y1, x2, y2, r, **kwargs)
 
     def _fallback_round_rect(self, x1, y1, x2, y2, r, **kwargs):
@@ -1606,24 +1812,22 @@ class MindMapApp:
         parts.append(self.canvas.create_arc(x1, y1, x1 + 2 * r, y1 + 2 * r, start=90, extent=90, style=tk.ARC, outline=outline, width=width))
         parts.append(self.canvas.create_arc(x1, y2 - 2 * r, x1 + 2 * r, y2, start=180, extent=90, style=tk.ARC, outline=outline, width=width))
         parts.append(self.canvas.create_arc(x2 - 2 * r, y2 - 2 * r, x2, y2, start=270, extent=90, style=tk.ARC, outline=outline, width=width))
-        body = self.canvas.create_rectangle(x1 + r, y1, x2 - r, y2, fill=fill, outline="")
-        left = self.canvas.create_rectangle(x1, y1 + r, x1 + r, y2 - r, fill=fill, outline="")
-        right = self.canvas.create_rectangle(x2 - r, y1 + r, x2, y2 - r, fill=fill, outline="")
-        top = self.canvas.create_rectangle(x1 + r, y1, x2 - r, y1 + r, fill=fill, outline="")
-        bottom = self.canvas.create_rectangle(x1 + r, y2 - r, x2 - r, y2, fill=fill, outline="")
-        group_tag = f"roundrect_{body}"
-        for i in parts + [body, left, right, top, bottom]:
+        body = self.canvas.create_rectangle(x1 + r, y1, x2 - r, y1 + 2, fill=fill, outline="")
+        body2 = self.canvas.create_rectangle(x1 + r, y2 - 2, x2 - r, y2, fill=fill, outline="")
+        left = self.canvas.create_rectangle(x1, y1 + r, x1 + 2, y2 - r, fill=fill, outline="")
+        right = self.canvas.create_rectangle(x2 - 2, y1 + r, x2, y2 - r, fill=fill, outline="")
+        mid = self.canvas.create_rectangle(x1 + 2, y1 + 2, x2 - 2, y2 - 2, fill=fill, outline="")
+        group_tag = f"roundrect_{mid}"
+        for i in parts + [body, body2, left, right, mid]:
             self.canvas.addtag_withtag(group_tag, i)
-        return body
+        return mid
 
     # ---------- Clipboard (Copy/Cut/Paste) ----------
     def _current_selection_nodes(self):
-        """Return a set of node ids representing current selection, expanding to clades in clade mode."""
         if self.selected_nodes:
             if self.select_mode.get() == "clade":
                 return self._expand_to_clade(set(self.selected_nodes))
             return set(self.selected_nodes)
-        # if no nodes, but an edge is selected, copy the edge + its endpoints
         if self.selected_line and self.selected_line in self.lines:
             a = self.lines[self.selected_line]["a"]
             b = self.lines[self.selected_line]["b"]
@@ -1631,7 +1835,6 @@ class MindMapApp:
         return set()
 
     def _selection_edges_within(self, nset):
-        """Return edges (line ids) whose endpoints are both in nset."""
         out = []
         for lid, info in self.lines.items():
             if info["a"] in nset and info["b"] in nset:
@@ -1639,18 +1842,14 @@ class MindMapApp:
         return out
 
     def _node_label_raw(self, nid):
-        """Get a raw label to persist through copy/paste."""
         if self.label_source.get() == "manual" and nid in self.manual_labels:
             return self.manual_labels[nid]
-        # derive a raw label from current display (best-effort)
         disp = self.canvas.itemcget(self.nodes[nid]["text"], "text")
         return self._display_to_raw_label(disp)
 
     def _build_clip_payload(self, nset, eset):
-        """Build a serializable clipboard payload with relative positions."""
         if not nset:
             return None
-        # base point: top-left of selection bbox
         xmins = []
         ymins = []
         for nid in nset:
@@ -1663,7 +1862,7 @@ class MindMapApp:
         base_y = min(ymins)
 
         nodes_out = []
-        idx_map = {}  # nid -> index
+        idx_map = {}
         for i, nid in enumerate(nset):
             cx, cy = self.node_center(nid)
             raw = self._node_label_raw(nid)
@@ -1686,7 +1885,6 @@ class MindMapApp:
             return
         eset = self._selection_edges_within(nset)
         self._clipboard = self._build_clip_payload(nset, eset)
-        # Also prime Tk clipboard with a simple text for convenience (labels)
         try:
             labels = [self._node_label_raw(n) for n in nset]
             self.root.clipboard_clear()
@@ -1700,10 +1898,8 @@ class MindMapApp:
         if not nset and not self.selected_line:
             messagebox.showinfo("Cut", "Nothing selected.")
             return
-        # If only an edge is selected and no nodes, cut just that edge
         if not nset and self.selected_line:
             self._clipboard = None
-            # Copy a minimal payload of the edge + endpoints (for meaningful paste)
             a = self.lines[self.selected_line]["a"]
             b = self.lines[self.selected_line]["b"]
             payload = self._build_clip_payload({a, b}, [self.selected_line])
@@ -1738,14 +1934,12 @@ class MindMapApp:
         edges = clip["edges"]
 
         px, py = self._paste_location()
-        # nudge each subsequent paste
         ox, oy = self._last_paste_offset
         px += ox
         py += oy
         self._last_paste_offset = (ox + PASTE_NUDGE, oy + PASTE_NUDGE)
 
         with self.bulk_update():
-            # create nodes
             idx_to_canvas = {}
             created = []
             for i, nd in enumerate(nodes):
@@ -1754,15 +1948,13 @@ class MindMapApp:
                 lbl = nd["label"]
                 nid = self.add_node(cx, cy, text=lbl, bulk=True)
                 idx_to_canvas[i] = nid
-                self.manual_labels[nid] = lbl  # paste as manual label
+                self.manual_labels[nid] = lbl
                 created.append(nid)
-            # create edges among pasted nodes
             for e in edges:
                 a_idx = e["from"]
                 b_idx = e["to"]
                 if a_idx in idx_to_canvas and b_idx in idx_to_canvas:
                     self.connect_nodes(idx_to_canvas[a_idx], idx_to_canvas[b_idx])
-            # finalize sizes/wraps and re-lines
             for nid in created:
                 self.resize_node_to_text(nid)
             self.update_connected_lines(created)
