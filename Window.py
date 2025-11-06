@@ -1198,7 +1198,7 @@ class MindMapApp:
     @staticmethod
     def _p_monom(ax, ay, c=1):
         return {(ax, ay): c} if c else {}
-
+# adding polynomials
     @staticmethod
     def _p_add(p, q):
         out = dict(p)
@@ -1207,7 +1207,7 @@ class MindMapApp:
             if out[k] == 0:
                 del out[k]
         return out
-
+#multiplying polynomials
     @staticmethod
     def _p_mul(p, q):
         if not p or not q:
